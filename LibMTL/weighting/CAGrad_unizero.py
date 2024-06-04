@@ -6,17 +6,14 @@ from scipy.optimize import minimize
 from LibMTL.weighting.abstract_weighting import AbsWeighting
 
 class CAGrad(AbsWeighting):
-    r"""CAGrad.
+    r"""Conflict-Averse Gradient descent (CAGrad).
     
-    This method is proposed in `Mitigating Gradient Bias in Multi-objective Learning: A Provably Convergent Approach (ICLR 2023) <https://openreview.net/forum?id=dLAYGdKTi2>`_ \
-    and implemented based on the author' sharing code (Heshan Fernando: fernah@rpi.edu). 
+    This method is proposed in `Conflict-Averse Gradient Descent for Multi-task learning (NeurIPS 2021) <https://openreview.net/forum?id=_61Qh8tULj_>`_ \
+    and implemented by modifying from the `official PyTorch implementation <https://github.com/Cranial-XIX/CAGrad>`_. 
 
     Args:
-        CAGrad_beta (float, default=0.5): The learning rate of y.
-        CAGrad_beta_sigma (float, default=0.5): The decay rate of CAGrad_beta.
-        CAGrad_gamma (float, default=0.1): The learning rate of lambd.
-        CAGrad_gamma_sigma (float, default=0.5): The decay rate of CAGrad_gamma.
-        CAGrad_rho (float, default=0): The \ell_2 regularization parameter of lambda's update.
+        calpha (float, default=0.5): A hyperparameter that controls the convergence rate.
+        rescale ({0, 1, 2}, default=1): The type of the gradient rescaling.
 
     .. warning::
             CAGrad is not supported by representation gradients, i.e., ``rep_grad`` must be ``False``.
