@@ -4,6 +4,9 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import numpy as np
 from LibMTL.weighting.abstract_weighting import AbsWeighting
+# 导入必要库，用于生成热力图
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 class MoCo(AbsWeighting):
     r"""MoCo.
@@ -48,13 +51,35 @@ class MoCo(AbsWeighting):
             self.grad_index.append(param.data.numel())
         self.grad_dim = sum(self.grad_index)
 
-    def init_param(self):
+    def init_param(self, **kwargs):
         self._compute_grad_dim()
         self.step = 0
         # y: [task_num, grad_dim]
         self.y = torch.zeros(self.task_num, self.grad_dim).to(self.device)
         # λ: [task_num, ]
         self.lambd = (torch.ones([self.task_num, ]) / self.task_num).to(self.device)
+
+        # 参数设置，可通过 kwargs 覆盖默认值
+        # self.beta = kwargs.get('MoCo_beta', 0.5)
+        # self.beta_sigma = kwargs.get('MoCo_beta_sigma', 0.5)
+        # self.gamma = kwargs.get('MoCo_gamma', 0.1)
+        # self.gamma_sigma = kwargs.get('MoCo_gamma_sigma', 0.5)
+
+        # moco param-v2
+        self.beta = kwargs.get('MoCo_beta', 0.99)
+        self.beta_sigma = kwargs.get('MoCo_beta_sigma', 0.3)
+        self.gamma = kwargs.get('MoCo_gamma', 10)
+        self.gamma_sigma = kwargs.get('MoCo_gamma_sigma', 0.3)
+
+        # moco param-v3
+        self.beta = kwargs.get('MoCo_beta', 0.99)
+        self.beta_sigma = kwargs.get('MoCo_beta_sigma', 0.5)
+        self.gamma = kwargs.get('MoCo_gamma', 10)
+        self.gamma_sigma = kwargs.get('MoCo_gamma_sigma', 0.5)
+
+        self.rho = kwargs.get('MoCo_rho', 0)
+        self.stat_interval = kwargs.get('MoCo_stat_interval', 1000)
+        # stat_interval = kwargs.get('MoCo_stat_interval', 1)
 
     def _compute_statistics(self, grads):
         """
@@ -70,7 +95,7 @@ class MoCo(AbsWeighting):
         stats = {}
         # 计算每个任务梯度的范数
         grad_norms = torch.norm(grads, dim=1)
-        stats['grad_norms'] = grad_norms.detach().cpu().numpy()
+        stats['grad_norms'] = grad_norms.detach().numpy()
 
         # 计算任务之间的 cosine similarity 矩阵
         # 先计算内积矩阵
@@ -84,7 +109,9 @@ class MoCo(AbsWeighting):
         stats['cos_sim_matrix'] = cos_sim_matrix.detach().cpu().numpy()
         # 计算除对角线外的平均 cosine similarity
         task_num = grads.shape[0]
-        mask = ~torch.eye(task_num, dtype=torch.bool, device=self.device)
+        device = cos_sim_matrix.device  # 获取 cos_sim_matrix 的设备
+        mask = ~torch.eye(task_num, dtype=torch.bool, device=device)
+
         avg_cos_sim = cos_sim_matrix[mask].mean().item()
         stats['avg_cos_sim'] = avg_cos_sim
 
@@ -112,37 +139,10 @@ class MoCo(AbsWeighting):
 
         self.step += 1  # 更新迭代步数
 
-        # 参数设置，可通过 kwargs 覆盖默认值
-        beta = kwargs.get('MoCo_beta', 0.5)
-        beta_sigma = kwargs.get('MoCo_beta_sigma', 0.5)
-        gamma = kwargs.get('MoCo_gamma', 0.1)
-        gamma_sigma = kwargs.get('MoCo_gamma_sigma', 0.5)
-        rho = kwargs.get('MoCo_rho', 0)
-        stat_interval = kwargs.get('MoCo_stat_interval', 1000)
-        # stat_interval = kwargs.get('MoCo_stat_interval', 1)
-
         if self.rep_grad:
             raise ValueError('不支持方法 MoCo 使用 representation gradients (rep_grad=True)')
 
         self._compute_grad_dim()
-
-        # # 1. 每个 rank 先计算本地任务的梯度
-        # local_task_num = len(losses)
-        # local_grads = torch.zeros(local_task_num, self.grad_dim, device=self.device)
-        # for i in range(local_task_num):
-        #     # 保证 retain_graph=True 以便多次 backward 计算不同任务的梯度
-        #     grad_list = torch.autograd.grad(
-        #         losses[i],
-        #         list(self.get_share_params()),
-        #         retain_graph=True,
-        #         allow_unused=True
-        #     )
-        #     grad_list = [
-        #         g if g is not None else torch.zeros_like(p)
-        #         for p, g in zip(list(self.get_share_params()), grad_list)
-        #     ]
-        #     local_grads[i] = torch.cat([g.view(-1) for g in grad_list])
-        #     self.zero_grad_share_params()
 
         # 1. 每个 rank 先计算本地任务的梯度
         local_task_num = len(losses)
@@ -160,15 +160,46 @@ class MoCo(AbsWeighting):
             # 清零共享参数的梯度，避免后续任务的共享梯度发生累加
             self.zero_grad_share_params()
 
-        # 2. 汇总各 rank 上的梯度
+       # 2. 汇总各 rank 上的梯度
         if multi_gpu:
             world_size = dist.get_world_size()
-            # 利用 all_gather_object 收集每个 rank 的 local_grads
+            
+            # 1. 记录当前 rank 的任务数
+            local_task_num = local_grads.shape[0]
+            
+            # 2. 利用 all_gather_object 收集每个 rank 的任务数（纯 Python 对象，数字）
+            all_local_task_nums = [None for _ in range(world_size)]
+            dist.all_gather_object(all_local_task_nums, local_task_num)
+            
+            # 3. 得到所有 rank 中最大的任务数
+            max_local_task_num = max(all_local_task_nums)
+            
+            # 4. 如果当前 rank 任务数不足，则在 local_grads 后方 pad 全0 张量，确保形状一致
+            if local_task_num < max_local_task_num:
+                pad_tensor = torch.zeros(max_local_task_num - local_task_num, self.grad_dim, device=self.device)
+                local_grads = torch.cat([local_grads, pad_tensor], dim=0)
+            
+            # 此时 local_grads 的形状统一为 [max_local_task_num, grad_dim]
+            # 为释放 GPU 显存，将本地张量转移到 CPU 中进行通信
+            local_grads_cpu = local_grads.cpu()
+            
+            # 5. 利用 all_gather_object 汇聚所有 rank 上的 local_grads_cpu
             all_local_grads = [None for _ in range(world_size)]
-            dist.all_gather_object(all_local_grads, local_grads)
+            dist.all_gather_object(all_local_grads, local_grads_cpu)
+            
             if rank == 0:
-                # 拼接得到 all_task_grads, 总行数须等于 self.task_num
-                all_task_grads = torch.cat([g.to(self.device) for g in all_local_grads], dim=0)
+                valid_grad_list = []
+                # 6. 对于每个 rank，根据实际有效的任务数（all_local_task_nums）剔除 padding
+                for i, tensor_cpu in enumerate(all_local_grads):
+                    valid_count = all_local_task_nums[i]
+                    # 仅保留前 valid_count 行
+                    tensor_valid = tensor_cpu[:valid_count, :]
+                    # 转回相应 device
+                    tensor_valid = tensor_valid.to(self.device)
+                    valid_grad_list.append(tensor_valid)
+                
+                # 7. 拼接得到所有任务的梯度，要求总行数等于 self.task_num
+                all_task_grads = torch.cat(valid_grad_list, dim=0)
                 if all_task_grads.shape[0] != self.task_num:
                     raise ValueError(f"Aggregated tasks mismatch: got {all_task_grads.shape[0]} tasks, expected {self.task_num}.")
                 grads = all_task_grads
@@ -194,6 +225,10 @@ class MoCo(AbsWeighting):
         else:
             aggregated_losses = losses
 
+        
+        # 在循环之前保存原始 grads 用于统计（可选）
+        raw_grads = grads.clone().cpu()
+
         stats = None  # 若本次未计算统计量则返回 None
         # 4. 仅在 rank0 上进行 MoCo 梯正逻辑及统计量计算
         if rank == 0:
@@ -204,28 +239,60 @@ class MoCo(AbsWeighting):
                     norm = grads[tn].norm()
                     if norm.item() == 0:
                         print(f"Warning: 任务 {tn} 的梯度范数为 0")
-                    else:
-                        if self.step % 1000 == 0:
-                            print(f"任务 {tn} 的梯度范数为 {norm.item()}")
+                    # else:
+                    #     if self.step % 1000 == 0:
+                    #         print(f"任务 {tn} 的梯度范数为 {norm.item()}")
                     grads[tn] = grads[tn] / (norm + 1e-8) * loss_val
 
                 # 若满足指定步数间隔，则计算并打印统计量
-                if self.step % stat_interval == 0:
-                    stats = self._compute_statistics(grads)
+                if self.step == 1 or self.step % self.stat_interval == 0:
+                    stats = self._compute_statistics(raw_grads)  # 使用原始梯度统计
                     print(f"Step {self.step} 梯度统计量:")
                     print(f"  每任务梯度范数: {stats['grad_norms']}")
                     print(f"  平均任务间 cosine similarity: {stats['avg_cos_sim']}")
-                    # 如有需要，可打印完整 cos_sim 矩阵
-                    # print(f"  Task cosine similarity 矩阵: \n{stats['cos_sim_matrix']}")
+
+                    # 设置绘图风格，使得热力图风格符合学术会议论文的要求
+                    sns.set(style="whitegrid", font_scale=1.2)
+
+                    # 构造热力图，设置图像尺寸和分辨率，同时将颜色范围固定为 -1 到 1，
+                    # 这里采用了 'RdBu' 颜色映射（你也可以根据实际需要选择其他 diverging colormap）
+                    plt.figure(figsize=(8, 6))
+                    ax = sns.heatmap(
+                        stats['cos_sim_matrix'],
+                        annot=True,            # 显示每个单元格的数值
+                        fmt=".2f",             # 数值格式保留 2 位小数
+                        cmap='RdBu',           # 使用 diverging colormap
+                        cbar=True,             # 显示颜色条
+                        square=True,           # 保证每个单元格为正方形
+                        vmin=-1,               # 显示值下限为 -1
+                        vmax=1                # 显示值上限为 1
+                    )
+                    plt.title(f"Step {self.step} Task Cosine Similarity", fontsize=16)
+                    plt.xlabel("Task Index", fontsize=14)
+                    plt.ylabel("Task Index", fontsize=14)
+                    
+                    # 指定保存路径（请将路径替换成你所期望的有效目录）
+                    # save_path = f"/mnt/afs/niuyazhe/code/LightZero/dmc_uz_cos_sim_heatmap/8games_notaskembed_paramv0/cos_sim_heatmap_step_{self.step}.png"
+                    save_path = f"/mnt/afs/niuyazhe/code/LightZero/dmc_uz_cos_sim_heatmap/8games_concataskembed_paramv0/cos_sim_heatmap_step_{self.step}.png"
+                    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+                    plt.close()
+
+                    print(f"Task cosine similarity 热力图已保存至 {save_path}")
 
                 # 平滑更新 y，beta 衰减可能与迭代步数有关
-                self.y = self.y - (beta / (self.step ** beta_sigma)) * (self.y - grads)
+                # self.y = self.y - (self.beta / (self.step ** self.beta_sigma)) * (self.y - grads)
+                # # 更新任务权重 λ（基于正则化 MGDA 子问题）
+                # self.lambd = F.softmax(
+                #     self.lambd - (self.gamma / (self.step ** self.gamma_sigma)) *
+                #     (self.y @ self.y.t() + self.rho * torch.eye(self.task_num, device=self.device)) @ self.lambd,
+                #     dim=-1
+                # )
+
+                # 使用平滑公式，更新跟踪变量 y
+                self.y = self.y - 0.99 * (self.y - grads)
                 # 更新任务权重 λ（基于正则化 MGDA 子问题）
-                self.lambd = F.softmax(
-                    self.lambd - (gamma / (self.step ** gamma_sigma)) *
-                    (self.y @ self.y.t() + rho * torch.eye(self.task_num, device=self.device)) @ self.lambd,
-                    dim=-1
-                )
+                self.lambd = F.softmax(self.lambd - 10 * (self.y@self.y.t())@self.lambd, -1)
+
                 # 根据更新后的 λ 与 y，计算新的共享梯度
                 new_grads = self.y.t() @ self.lambd
         else:
