@@ -43,13 +43,10 @@ class MoCo(AbsWeighting):
         return self.share_model.parameters()
 
     def _compute_grad_dim(self):
-        """
-        计算共享参数梯度拼接后的维度，
-        假设 get_share_params 返回的是一个可迭代对象，
-        每个参数 view(-1) 后拼接在一起。
-        """
-        params = list(self.get_share_params())
-        self.grad_dim = sum(p.numel() for p in params if p.requires_grad)
+        self.grad_index = []
+        for param in self.get_share_params():
+            self.grad_index.append(param.data.numel())
+        self.grad_dim = sum(self.grad_index)
 
     def init_param(self):
         self._compute_grad_dim()
@@ -121,7 +118,7 @@ class MoCo(AbsWeighting):
         gamma = kwargs.get('MoCo_gamma', 0.1)
         gamma_sigma = kwargs.get('MoCo_gamma_sigma', 0.5)
         rho = kwargs.get('MoCo_rho', 0)
-        stat_interval = kwargs.get('MoCo_stat_interval', 10000)
+        stat_interval = kwargs.get('MoCo_stat_interval', 1000)
         # stat_interval = kwargs.get('MoCo_stat_interval', 1)
 
         if self.rep_grad:
@@ -129,22 +126,38 @@ class MoCo(AbsWeighting):
 
         self._compute_grad_dim()
 
+        # # 1. 每个 rank 先计算本地任务的梯度
+        # local_task_num = len(losses)
+        # local_grads = torch.zeros(local_task_num, self.grad_dim, device=self.device)
+        # for i in range(local_task_num):
+        #     # 保证 retain_graph=True 以便多次 backward 计算不同任务的梯度
+        #     grad_list = torch.autograd.grad(
+        #         losses[i],
+        #         list(self.get_share_params()),
+        #         retain_graph=True,
+        #         allow_unused=True
+        #     )
+        #     grad_list = [
+        #         g if g is not None else torch.zeros_like(p)
+        #         for p, g in zip(list(self.get_share_params()), grad_list)
+        #     ]
+        #     local_grads[i] = torch.cat([g.view(-1) for g in grad_list])
+        #     self.zero_grad_share_params()
+
         # 1. 每个 rank 先计算本地任务的梯度
         local_task_num = len(losses)
         local_grads = torch.zeros(local_task_num, self.grad_dim, device=self.device)
         for i in range(local_task_num):
-            # 保证 retain_graph=True 以便多次 backward 计算不同任务的梯度
-            grad_list = torch.autograd.grad(
-                losses[i],
-                list(self.get_share_params()),
-                retain_graph=True,
-                allow_unused=True
-            )
-            grad_list = [
-                g if g is not None else torch.zeros_like(p)
-                for p, g in zip(list(self.get_share_params()), grad_list)
-            ]
-            local_grads[i] = torch.cat([g.view(-1) for g in grad_list])
+            # import ipdb;ipdb.set_trace()
+            # 对每个任务的 loss 调用 backward 计算全网络梯度（共享部分和 head 部分）
+            # 注意：由于后续需要多次计算共享部分梯度，非最后一次调用 retain_graph=True
+            if i != local_task_num - 1:
+                losses[i].backward(retain_graph=True)
+            else:
+                losses[i].backward()
+            # 提取共享参数的梯度（encoder/backbone），head 部分的梯度不受影响
+            local_grads[i] = self._grad2vec()
+            # 清零共享参数的梯度，避免后续任务的共享梯度发生累加
             self.zero_grad_share_params()
 
         # 2. 汇总各 rank 上的梯度
