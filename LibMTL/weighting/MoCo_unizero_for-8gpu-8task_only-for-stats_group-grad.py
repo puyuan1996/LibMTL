@@ -1,5 +1,3 @@
-# MoCo_unizero_for-8gpu-8task_only-for-stats_group-grad.py
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
