@@ -89,17 +89,45 @@ class MoCo(AbsWeighting):
 
     def _compute_group_indices(self):
         """
-        利用 share_model.get_group_parameters() 计算各组在全局梯度中对应的起始与终止索引，
+        利用 share_model.get_group_parameters() 计算各组在全局梯度中对应的起始与结束索引，
         要求 share_model.parameters() 返回的参数顺序与 get_group_parameters() 中各组参数顺序一致。
+
+        本方法分两部分计算索引：
+        1. 主要模块的索引： 'tokenizer', 'transformer', 'pos_emb', 'act_embedding_table'
+        2. transformer 内各层（block）的索引： 'transformer_layer_0', 'transformer_layer_1', ...
+            若 transformer 内还有额外参数（例如 ln_f），则把它们归入新组 'transformer_extra'
         """
         group_params = self.share_model.get_group_parameters()
-        # 下面按照字典的插入顺序遍历（Python3.7+ dict 保持插入顺序）
         self.group_indices = {}
         offset = 0
-        for group, params in group_params.items():
-            numel = sum([p.data.numel() for p in params])
+
+        # 计算主要模块索引（与 parameters() 返回顺序一致）
+        main_groups = ['tokenizer', 'transformer', 'pos_emb', 'act_embedding_table']
+        for group in main_groups:
+            params = group_params[group]
+            numel = sum(p.data.numel() for p in params)
             self.group_indices[group] = (offset, offset + numel)
             offset += numel
+
+        # transformer组在整体参数中的范围
+        transformer_start, transformer_end = self.group_indices['transformer']
+
+        # 计算 transformer 内各 block 索引。这里假设 blocks 对应的参数在 transformer.parameters() 中是连续排列的
+        internal_offset = transformer_start
+        layer_keys = sorted(
+            [key for key in group_params.keys() if key.startswith('transformer_layer_')],
+            key=lambda x: int(x.split('_')[-1])
+        )
+        # 累加 transformer_layer_* 的参数数目
+        for key in layer_keys:
+            params = group_params[key]
+            numel = sum(p.data.numel() for p in params)
+            self.group_indices[key] = (internal_offset, internal_offset + numel)
+            internal_offset += numel
+
+        # 如果 transformer 内还有额外参数（例如 ln_f）未被 transformer_layer_* 覆盖，则归类为 transformer_extra
+        if internal_offset < transformer_end:
+            self.group_indices['transformer_extra'] = (internal_offset, transformer_end)
 
     def _compute_statistics_from_slice(self, raw_grads, start, end):
         """
@@ -271,13 +299,14 @@ class MoCo(AbsWeighting):
                         print(f"Warning: 任务 {tn} 的梯度范数为 0")
                     grads[tn] = grads[tn] / (norm + 1e-8) * loss_val
 
-                # 先对各个分组利用预先计算的切片索引计算统计
-                for group, (start, end) in self.group_indices.items():
-                    group_stats[group] = self._compute_statistics_from_slice(raw_grads, start, end)
-                    print(f"Step {self.step} 分组 {group} 平均 cosine similarity: {group_stats[group]['avg_cos_sim']:.4f}")
-
                 # 若满足指定步数间隔，则计算并打印整体统计量，并绘制与保存热力图
                 if self.step == 1 or self.step % self.stat_interval == 0:
+                    # 先对各个分组利用预先计算的切片索引计算统计
+                    for group, (start, end) in self.group_indices.items():
+                        # import ipdb;ipdb.set_trace()
+                        group_stats[group] = self._compute_statistics_from_slice(raw_grads, start, end)
+                        print(f"Step {self.step} 分组 {group} 平均 cosine similarity: {group_stats[group]['avg_cos_sim']:.4f}")
+                        
                     stats = self._compute_statistics(raw_grads)  # 使用整体 raw_grads 统计
                     print(f"Step {self.step} 整体梯度统计量:")
                     print(f"  每任务梯度范数: {stats['grad_norms']}")
