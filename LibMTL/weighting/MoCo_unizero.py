@@ -358,8 +358,8 @@ class MoCo(AbsWeighting):
                     
                     # 构造合理的目录结构和命名方式
                     # 设置 base_dir 路径，请根据实际项目目录进行调整
-                    # base_dir = "/mnt/afs/niuyazhe/code/LightZero/dmc_uz_cos_sim_heatmap_layer/8games_notaskembed"
-                    base_dir = "/mnt/afs/niuyazhe/code/LightZero/dmc_uz_cos_sim_heatmap_layer/8games_concattaskembed"
+                    base_dir = "/mnt/afs/niuyazhe/code/LightZero/dmc_uz_cos_sim_heatmap_layer/8games_notaskembed"
+                    # base_dir = "/mnt/afs/niuyazhe/code/LightZero/dmc_uz_cos_sim_heatmap_layer/8games_concattaskembed"
 
                     # 如果目录不存在，可提前创建（示例中略去创建代码）
                     overall_save_path = f"{base_dir}/combined_cos_sim_heatmap_step_{self.step}.png"
