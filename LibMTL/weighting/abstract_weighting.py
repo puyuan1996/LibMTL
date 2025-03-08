@@ -65,7 +65,9 @@ class AbsWeighting(nn.Module):
             if param.grad is not None:
                 beg = 0 if count == 0 else sum(self.grad_index[:count])
                 end = sum(self.grad_index[:(count+1)])
-                param.grad.data = new_grads[beg:end].contiguous().view(param.data.size()).data.clone()
+                # param.grad.data = new_grads[beg:end].contiguous().view(param.data.size()).data.clone()
+                # 保证 new_grad 在 param 所在设备和相同数据类型上
+                param.grad.data = new_grads[beg:end].contiguous().view(param.data.size()).data.clone().to(param.data.device, param.data.dtype)
             count += 1
             
     def _get_grads(self, losses, mode='backward'):

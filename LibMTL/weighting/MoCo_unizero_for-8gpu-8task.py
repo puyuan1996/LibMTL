@@ -66,10 +66,10 @@ class MoCo(AbsWeighting):
         # self.gamma_sigma = kwargs.get('MoCo_gamma_sigma', 0.5)
 
         # moco param-v2
-        self.beta = kwargs.get('MoCo_beta', 0.99)
-        self.beta_sigma = kwargs.get('MoCo_beta_sigma', 0.3)
-        self.gamma = kwargs.get('MoCo_gamma', 10)
-        self.gamma_sigma = kwargs.get('MoCo_gamma_sigma', 0.3)
+        # self.beta = kwargs.get('MoCo_beta', 0.99)
+        # self.beta_sigma = kwargs.get('MoCo_beta_sigma', 0.3)
+        # self.gamma = kwargs.get('MoCo_gamma', 10)
+        # self.gamma_sigma = kwargs.get('MoCo_gamma_sigma', 0.3)
 
         # moco param-v3
         self.beta = kwargs.get('MoCo_beta', 0.99)
@@ -137,6 +137,10 @@ class MoCo(AbsWeighting):
         rank = dist.get_rank() if multi_gpu else 0
         self.device = f'cuda:{rank}'
 
+        # 确保共享变量在本 rank 的 device 上，并统一数据类型
+        self.y = self.y.to(self.device, dtype=torch.float32)
+        self.lambd = self.lambd.to(self.device, dtype=torch.float32)
+
         self.step += 1  # 更新迭代步数
 
         if self.rep_grad:
@@ -176,9 +180,11 @@ class MoCo(AbsWeighting):
                 # 拼接得到 all_task_grads, 总行数须等于 self.task_num
                 # all_task_grads = torch.cat([g.to(self.device) for g in all_local_grads], dim=0)
                 
-                # 拼接得到所有任务的梯度，并转回 self.device
-                all_task_grads = torch.cat([torch.as_tensor(g).to(self.device) for g in all_local_grads], dim=0)
-
+                # 将收集到的数据拼接，并转换到当前 device 与 dtype
+                all_task_grads = torch.cat(
+                    [torch.as_tensor(g, dtype=torch.float32).to(self.device) for g in all_local_grads],
+                    dim=0
+                )
                 if all_task_grads.shape[0] != self.task_num:
                     raise ValueError(f"Aggregated tasks mismatch: got {all_task_grads.shape[0]} tasks, expected {self.task_num}.")
                 grads = all_task_grads
@@ -226,7 +232,8 @@ class MoCo(AbsWeighting):
                     grads[tn] = grads[tn] / (norm + 1e-8) * loss_val
 
                 # 若满足指定步数间隔，则计算并打印统计量
-                if self.step == 1 or self.step % self.stat_interval == 0:
+                # if self.step == 1 or self.step % self.stat_interval == 0:
+                if False:
                     stats = self._compute_statistics(raw_grads)  # 使用原始梯度统计
                     print(f"Step {self.step} 梯度统计量:")
                     print(f"  每任务梯度范数: {stats['grad_norms']}")
@@ -254,7 +261,7 @@ class MoCo(AbsWeighting):
                     
                     # 指定保存路径（请将路径替换成你所期望的有效目录）
                     # save_path = f"/mnt/afs/niuyazhe/code/LightZero/dmc_uz_cos_sim_heatmap/8games_notaskembed_paramv0/cos_sim_heatmap_step_{self.step}.png"
-                    save_path = f"/mnt/afs/niuyazhe/code/LightZero/dmc_uz_cos_sim_heatmap/8games_concataskembed_paramv0/cos_sim_heatmap_step_{self.step}.png"
+                    # save_path = f"/mnt/afs/niuyazhe/code/LightZero/dmc_uz_cos_sim_heatmap/8games_concataskembed_paramv0/cos_sim_heatmap_step_{self.step}.png"
                     plt.savefig(save_path, dpi=300, bbox_inches='tight')
                     plt.close()
 
@@ -276,6 +283,10 @@ class MoCo(AbsWeighting):
 
                 # 根据更新后的 λ 与 y，计算新的共享梯度
                 new_grads = self.y.t() @ self.lambd
+
+                # **关键修改：保证 new_grads 的 dtype 与共享模型一致**
+                # preferred_dtype = list(self.share_model.parameters())[0].dtype
+                # new_grads = new_grads.to(preferred_dtype)
         else:
             new_grads = torch.empty(self.grad_dim, device=self.device)
 
