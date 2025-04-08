@@ -228,6 +228,7 @@ class MoCo(AbsWeighting):
         raw_grads = grads.clone().cpu()
         stats = None  # 默认不计算统计量
         if rank == 0:
+
             # print("=" * 20)
             # print("we are in moco")
             # print(f"len(aggregated_losses):{len(aggregated_losses)}, aggregated_losses:{aggregated_losses}")

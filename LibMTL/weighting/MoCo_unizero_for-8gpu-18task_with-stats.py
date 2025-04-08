@@ -228,6 +228,7 @@ class MoCo(AbsWeighting):
         raw_grads = grads.clone().cpu()
         stats = None  # 默认不计算统计量
         if rank == 0:
+
             # print("=" * 20)
             # print("we are in moco")
             # print(f"len(aggregated_losses):{len(aggregated_losses)}, aggregated_losses:{aggregated_losses}")
@@ -241,6 +242,51 @@ class MoCo(AbsWeighting):
                     if norm.item() == 0:
                         print(f"Warning: 任务 {tn} 的梯度范数为 0")
                     grads[tn] = grads[tn] / (norm + 1e-8) * loss_val
+
+                # 若满足指定步数间隔，则计算并打印统计量
+                if self.step == 1 or self.step % self.stat_interval == 0:
+                    stats = self._compute_statistics(raw_grads)  # 使用原始梯度统计
+                    print(f"Step {self.step} 梯度统计量:")
+                    print(f"  每任务梯度范数: {stats['grad_norms']}")
+                    print(f"  平均任务间 cosine similarity: {stats['avg_cos_sim']}")
+
+                    # 设置绘图风格，使得热力图风格符合学术会议论文的要求
+                    sns.set(style="whitegrid", font_scale=1.2)
+
+                    # 构造热力图，设置图像尺寸和分辨率，同时将颜色范围固定为 -1 到 1，
+                    # 这里采用了 'RdBu' 颜色映射（你也可以根据实际需要选择其他 diverging colormap）
+                    plt.figure(figsize=(8, 6))
+                    ax = sns.heatmap(
+                        stats['cos_sim_matrix'],
+                        annot=True,            # 显示每个单元格的数值
+                        fmt=".2f",             # 数值格式保留 2 位小数
+                        cmap='RdBu',           # 使用 diverging colormap
+                        cbar=True,             # 显示颜色条
+                        square=True,           # 保证每个单元格为正方形
+                        vmin=-1,               # 显示值下限为 -1
+                        vmax=1                # 显示值上限为 1
+                    )
+                    plt.title(f"Step {self.step} Task Cosine Similarity", fontsize=16)
+                    plt.xlabel("Task Index", fontsize=14)
+                    plt.ylabel("Task Index", fontsize=14)
+                    
+                    # 指定保存路径（请将路径替换成你所期望的有效目录）
+                    save_path = f"/mnt/afs/niuyazhe/code/LightZero/dmc_uz_cos_sim_heatmap_layer/8games_notaskembed_paramv0/cos_sim_heatmap_step_{self.step}.png"
+                    # save_path = f"/mnt/afs/niuyazhe/code/LightZero/dmc_uz_cos_sim_heatmap_layer/8games_concataskembed_paramv0/cos_sim_heatmap_step_{self.step}.png"
+                    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+                    plt.close()
+
+                    print(f"Task cosine similarity 热力图已保存至 {save_path}")
+
+                # 平滑更新 y，beta 衰减可能与迭代步数有关
+                # self.y = self.y - (self.beta / (self.step ** self.beta_sigma)) * (self.y - grads)
+                # # 更新任务权重 λ（基于正则化 MGDA 子问题）
+                # self.lambd = F.softmax(
+                #     self.lambd - (self.gamma / (self.step ** self.gamma_sigma)) *
+                #     (self.y @ self.y.t() + self.rho * torch.eye(self.task_num, device=self.device)) @ self.lambd,
+                #     dim=-1
+                # )
+
                 # 平滑更新 y（采用固定平滑系数，也可根据步数调整）
                 self.y = self.y - 0.99 * (self.y - grads)
                 # 更新 λ（基于正则化 MGDA 子问题）
