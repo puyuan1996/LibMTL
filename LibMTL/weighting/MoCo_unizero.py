@@ -97,7 +97,9 @@ class MoCo(AbsWeighting):
         for param in self.get_share_params():
             numel = param.data.numel()
             grad_segment = new_grad[offset: offset + numel].view_as(param)
-            param.grad = grad_segment.clone()
+            # param.grad = grad_segment.clone().to(param.device) # TODO: .to(param.device) is important for atari share encoder
+            param.grad = grad_segment.clone()# TODO: .to(param.device) is important for atari share encoder
+            
             offset += numel
 
     def _compute_statistics(self, grads):
@@ -131,140 +133,144 @@ class MoCo(AbsWeighting):
         return stats
 
     def backward(self, losses, **kwargs):
-        """
-        输入:
-          losses: 当前 rank 上各个任务的 loss list，
-                  每个 loss 均为标量且 requires_grad=True；
-                  当前 rank 上任务数量 = len(losses)（不同 rank 可能不同）
-        逻辑流程：
-          1. 每个 rank 对本地所有任务分别采用 torch.autograd.grad 得到梯度（local_grads: [local_task_num, grad_dim]）；
-          2. 利用 dist.all_gather_object 汇总各 rank 上的 local_grads，拼接成总任务数的 grads（[self.task_num, grad_dim]）；
-          3. 同样汇总各 rank 上的 loss，得到 aggregated_losses（列表中每个元素为 scalar tensor）；
-          4. 仅在 rank0 上进行 MoCo 梯正：归一化每个任务梯度、利用对应 loss 缩放、平滑更新 y 与 λ，然后计算新的共享梯度 new_grads；
-             同时在指定步数间隔内计算各任务梯度统计量（如 cosine similarity 等）并打印；
-          5. 将 new_grads 广播给所有 rank，调用 _reset_grad 更新共享模型梯度；
-          6. 同步 λ 并返回（numpy 格式）以及统计量（若本次未计算则返回 None）。
-        """
-        # 判断是否为多 GPU 环境
-        multi_gpu = self.multi_gpu and dist.is_initialized()
-        rank = dist.get_rank() if multi_gpu else 0
-        self.device = f'cuda:{rank}'
-        self.step += 1  # 更新迭代步数
+            """
+            输入:
+            losses: 当前 rank 上各个任务的 loss list，
+                    每个 loss 均为标量且 requires_grad=True；
+                    当前 rank 上任务数量 = len(losses)（不同 rank 可能不同）
+            逻辑流程：
+            1. 每个 rank 对本地所有任务分别采用 torch.autograd.grad 得到梯度（local_grads: [local_task_num, grad_dim]）；
+            2. 利用 dist.all_gather_object 汇总各 rank 上的 local_grads，拼接成总任务数的 grads（[self.task_num, grad_dim]）；
+            3. 同样汇总各 rank 上的 loss，得到 aggregated_losses（列表中每个元素为 scalar tensor）；
+            4. 仅在 rank0 上进行 MoCo 梯正：归一化每个任务梯度、利用对应 loss 缩放、平滑更新 y 与 λ，然后计算新的共享梯度 new_grads；
+                同时在指定步数间隔内计算各任务梯度统计量（如 cosine similarity 等）并打印；
+            5. 将 new_grads 广播给所有 rank，调用 _reset_grad 更新共享模型梯度；
+            6. 同步 λ 并返回（numpy 格式）以及统计量（若本次未计算则返回 None）。
+            """
+            # 判断是否为多 GPU 环境
+            multi_gpu = self.multi_gpu and dist.is_initialized()
+            rank = dist.get_rank() if multi_gpu else 0
+            self.device = f'cuda:{rank}'
 
-        if self.rep_grad:
-            raise ValueError('不支持方法 MoCo 使用 representation gradients (rep_grad=True)')
+            # 将 self.y 与 self.lambd 转移到当前设备，避免设备不一致问题
+            self.y = self.y.to(self.device)
+            self.lambd = self.lambd.to(self.device)
 
-        self._compute_grad_dim()
+            self.step += 1  # 更新迭代步数
 
-        # 1. 每个 rank 计算本地任务的梯度
-        local_task_num = len(losses)
-        local_grads = torch.zeros(local_task_num, self.grad_dim, device=self.device)
-        for i in range(local_task_num):
-            # 对每个任务的 loss 调用 backward 计算全网络梯度
-            if i != local_task_num - 1:
-                losses[i].backward(retain_graph=True)
+            if self.rep_grad:
+                raise ValueError('不支持方法 MoCo 使用 representation gradients (rep_grad=True)')
+
+            self._compute_grad_dim()
+
+            # 1. 每个 rank 计算本地任务的梯度
+            local_task_num = len(losses)
+            local_grads = torch.zeros(local_task_num, self.grad_dim, device=self.device)
+            for i in range(local_task_num):
+                # 对每个任务的 loss 调用 backward 计算全网络梯度
+                if i != local_task_num - 1:
+                    losses[i].backward(retain_graph=True)
+                else:
+                    losses[i].backward()
+                # 提取共享参数的梯度
+                local_grads[i] = self._grad2vec()
+                # 清零共享参数梯度，防止梯度累加
+                self.zero_grad_share_params()
+
+            # 2. 汇总各 rank 上的梯度
+            if multi_gpu:
+                world_size = dist.get_world_size()
+                # 收集每个 rank 上真实的任务数
+                all_local_task_nums = [None for _ in range(world_size)]
+                dist.all_gather_object(all_local_task_nums, local_task_num)
+
+                # if rank == 0:
+                #     print("=" * 20)
+                #     print(f"all_local_task_nums:{all_local_task_nums}")
+                #     print("=" * 20)
+
+                max_local_task_num = max(all_local_task_nums)
+                # 若当前 rank 任务数不足，则 pad 0，以达到一致形状
+                if local_task_num < max_local_task_num:
+                    pad_tensor = torch.zeros(max_local_task_num - local_task_num, self.grad_dim, device=self.device)
+                    local_grads = torch.cat([local_grads, pad_tensor], dim=0)
+                # 将 local_grads 移至 CPU
+                local_grads_cpu = local_grads.cpu()
+                all_local_grads = [None for _ in range(world_size)]
+                dist.all_gather_object(all_local_grads, local_grads_cpu)
+                if rank == 0:
+                    valid_grad_list = []
+                    for i, tensor_cpu in enumerate(all_local_grads):
+                        valid_count = all_local_task_nums[i]
+                        tensor_valid = tensor_cpu[:valid_count, :].to(self.device)
+                        valid_grad_list.append(tensor_valid)
+                    all_task_grads = torch.cat(valid_grad_list, dim=0)
+                    if all_task_grads.shape[0] != self.task_num:
+                        raise ValueError(f"Aggregated tasks mismatch: got {all_task_grads.shape[0]} tasks, expected {self.task_num}.")
+                    grads = all_task_grads
+                else:
+                    grads = torch.empty(self.task_num, self.grad_dim, device=self.device)
             else:
-                losses[i].backward()
-            # 提取共享参数的梯度
-            local_grads[i] = self._grad2vec()
-            # 清零共享参数梯度，防止梯度累加
-            self.zero_grad_share_params()
+                if local_task_num != self.task_num:
+                    raise ValueError("在单 GPU 模式下，loss 数量应等于 self.task_num.")
+                grads = local_grads
 
-        # 2. 汇总各 rank 上的梯度
-        if multi_gpu:
-            world_size = dist.get_world_size()
-            # 收集每个 rank 上真实的任务数
-            all_local_task_nums = [None for _ in range(world_size)]
-            dist.all_gather_object(all_local_task_nums, local_task_num)
-            # if rank == 0:
-            #     print("=" * 20)
-            #     print(f"all_local_task_nums:{all_local_task_nums}")
-            #     print("=" * 20)
-            max_local_task_num = max(all_local_task_nums)
-            # 若当前 rank 任务数不足，则 pad 0，以达到一致形状
-            if local_task_num < max_local_task_num:
-                pad_tensor = torch.zeros(max_local_task_num - local_task_num, self.grad_dim, device=self.device)
-                local_grads = torch.cat([local_grads, pad_tensor], dim=0)
-            # 将 local_grads 移至 CPU
-            local_grads_cpu = local_grads.cpu()
-            all_local_grads = [None for _ in range(world_size)]
-            dist.all_gather_object(all_local_grads, local_grads_cpu)
+            # 3. 同步各 rank 上的 loss 值
+            if multi_gpu:
+                local_losses_list = [loss.detach() for loss in losses]
+                all_losses_lists = [None for _ in range(world_size)]
+                dist.all_gather_object(all_losses_lists, local_losses_list)
+                if rank == 0:
+                    aggregated_losses = []
+                    for loss_list in all_losses_lists:
+                        aggregated_losses.extend(loss_list)
+                    if len(aggregated_losses) != self.task_num:
+                        raise ValueError(f"Aggregated losses mismatch: got {len(aggregated_losses)} losses, expected {self.task_num}.")
+                else:
+                    aggregated_losses = None
+            else:
+                aggregated_losses = losses
+
+            # 可选：保存原始 grads 用于统计
+            raw_grads = grads.clone().cpu()
+            stats = None  # 默认不计算统计量
             if rank == 0:
-                valid_grad_list = []
-                for i, tensor_cpu in enumerate(all_local_grads):
-                    valid_count = all_local_task_nums[i]
-                    tensor_valid = tensor_cpu[:valid_count, :].to(self.device)
-                    valid_grad_list.append(tensor_valid)
-                all_task_grads = torch.cat(valid_grad_list, dim=0)
-                if all_task_grads.shape[0] != self.task_num:
-                    raise ValueError(f"Aggregated tasks mismatch: got {all_task_grads.shape[0]} tasks, expected {self.task_num}.")
-                grads = all_task_grads
+                # print("=" * 20)
+                # print("we are in moco")
+                # print(f"len(aggregated_losses):{len(aggregated_losses)}, aggregated_losses:{aggregated_losses}")
+                # print("=" * 20)
+                with torch.no_grad():
+                    # 归一化梯度并乘以对应 loss 值
+                    for tn in range(self.task_num):
+                        loss_val = aggregated_losses[tn].to(self.device)
+                        norm = grads[tn].norm()
+                        if norm.item() == 0:
+                            print(f"Warning: 任务 {tn} 的梯度范数为 0")
+                        grads[tn] = grads[tn] / (norm + 1e-8) * loss_val
+                    # 平滑更新 y（采用固定平滑系数，也可根据步数调整）
+                    self.y = self.y - 0.99 * (self.y - grads)
+                    # 更新 λ（基于正则化 MGDA 子问题）
+                    self.lambd = F.softmax(self.lambd - 10 * (self.y @ self.y.t()) @ self.lambd, dim=-1)
+                    new_grads = self.y.t() @ self.lambd
             else:
-                grads = torch.empty(self.task_num, self.grad_dim, device=self.device)
-        else:
-            if local_task_num != self.task_num:
-                raise ValueError("在单 GPU 模式下，loss 数量应等于 self.task_num.")
-            grads = local_grads
+                new_grads = torch.empty(self.grad_dim, device=self.device)
 
-        # 3. 同步各 rank 上的 loss 值
-        if multi_gpu:
-            # 修复前使用 tensor all_gather 导致 shape pad 问题
-            # 这里采用 all_gather_object 直接传输各个 rank 的 loss list
-            local_losses_list = [loss.detach() for loss in losses]
-            all_losses_lists = [None for _ in range(world_size)]
-            dist.all_gather_object(all_losses_lists, local_losses_list)
+            # 4. 广播新的共享梯度并更新模型参数梯度
+            if multi_gpu:
+                if rank == 0:
+                    new_grads_tensor = new_grads
+                else:
+                    new_grads_tensor = torch.empty(self.grad_dim, device=self.device)
+                dist.broadcast(new_grads_tensor, src=0)
+                self._reset_grad(new_grads_tensor)
+            else:
+                self._reset_grad(new_grads)
+
+            # 5. 同步 λ
             if rank == 0:
-                aggregated_losses = []
-                for loss_list in all_losses_lists:
-                    aggregated_losses.extend(loss_list)
-                if len(aggregated_losses) != self.task_num:
-                    raise ValueError(f"Aggregated losses mismatch: got {len(aggregated_losses)} losses, expected {self.task_num}.")
+                lambd_val = self.lambd
             else:
-                aggregated_losses = None
-        else:
-            aggregated_losses = losses
-
-        # 可选：保存原始 grads 用于统计
-        raw_grads = grads.clone().cpu()
-        stats = None  # 默认不计算统计量
-        if rank == 0:
-            # print("=" * 20)
-            # print("we are in moco")
-            # print(f"len(aggregated_losses):{len(aggregated_losses)}, aggregated_losses:{aggregated_losses}")
-            # print("=" * 20)
-
-            with torch.no_grad():
-                # 归一化梯度并乘以对应 loss 值
-                for tn in range(self.task_num):
-                    loss_val = aggregated_losses[tn].to(self.device)
-                    norm = grads[tn].norm()
-                    if norm.item() == 0:
-                        print(f"Warning: 任务 {tn} 的梯度范数为 0")
-                    grads[tn] = grads[tn] / (norm + 1e-8) * loss_val
-                # 平滑更新 y（采用固定平滑系数，也可根据步数调整）
-                self.y = self.y - 0.99 * (self.y - grads)
-                # 更新 λ（基于正则化 MGDA 子问题）
-                self.lambd = F.softmax(self.lambd - 10 * (self.y @ self.y.t()) @ self.lambd, dim=-1)
-                new_grads = self.y.t() @ self.lambd
-        else:
-            new_grads = torch.empty(self.grad_dim, device=self.device)
-
-        # 4. 广播新的共享梯度并更新模型参数梯度
-        if multi_gpu:
-            if rank == 0:
-                new_grads_tensor = new_grads
-            else:
-                new_grads_tensor = torch.empty(self.grad_dim, device=self.device)
-            dist.broadcast(new_grads_tensor, src=0)
-            self._reset_grad(new_grads_tensor)
-        else:
-            self._reset_grad(new_grads)
-
-        # 5. 同步 λ
-        if rank == 0:
-            lambd_val = self.lambd
-        else:
-            lambd_val = torch.zeros_like(self.lambd)
-        if multi_gpu:
-            dist.broadcast(lambd_val, src=0)
-        return lambd_val.detach().cpu().numpy(), stats
+                lambd_val = torch.zeros_like(self.lambd)
+            if multi_gpu:
+                dist.broadcast(lambd_val, src=0)
+            return lambd_val.detach().cpu().numpy(), stats
