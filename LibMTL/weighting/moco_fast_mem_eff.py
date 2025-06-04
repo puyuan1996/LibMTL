@@ -53,6 +53,8 @@ class FastMoCoMemEff:
         self.cfg = cfg or MoCoCfg()
         self.mem_cfg = mem_cfg or MemCfg()
 
+        print(f"self.mem_cfg:{self.mem_cfg}")
+
         self.grad_dim = sum(p.numel() for p in self.module.parameters())
         self._init_state()
 
